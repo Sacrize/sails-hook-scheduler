@@ -8,7 +8,11 @@ module.exports = function (sails) {
     let workerId;
 
     sails.on('ready', function() {
+        _checkDependencies();
         workerId = _getRandomHash();
+        if (config.queue.enable) {
+            _becomeLeader();
+        }
     });
 
     return {
@@ -26,6 +30,7 @@ module.exports = function (sails) {
                         options: {},
                         ns: 'scheduler',
                         password: undefined,
+                        datastoreName: 'scheduler',
                     },
                     leader: {
                         redisField: 'leader',
@@ -33,14 +38,14 @@ module.exports = function (sails) {
                         changeCooldown: 3600,
                         cronJob: {
                             name: 'schedulerBecomeLeader',
-                            schedule: '*/5 * * * * *'
+                            schedule: '0 * * * * *'
                         },
                     },
                     executor: {
-                        ttl: 60,
                         cronJob: {
                             name: 'schedulerTaskExecutor',
-                            schedule: '*/5 * * * * *'
+                            schedule: '* * * * * *',
+                            ttl: 60,
                         },
                     },
                 },
@@ -67,6 +72,12 @@ module.exports = function (sails) {
                         _executeTaskFromQueue();
                     },
                 };
+                if (!(config.queue.redis.datastoreName in sails.config.datastores)) {
+                    sails.config.datastores[config.queue.redis.datastoreName] = {
+                        adapter: 'sails-redis',
+                        ...config.queue.redis,
+                    };
+                }
             }
             for (let task of _.keys(config.jobs)) {
                 sails.config.cron[config.jobPrefix + task] = {
@@ -80,26 +91,28 @@ module.exports = function (sails) {
     }
 
     function _pushToQueueOrExecute(task) {
-        if (config.queue.enable && sails.hooks.queues.isReady(config.queue.name) && leader) {
-            _pushTaskToQueue(task);
+        if (config.queue.enable) {
+            if (leader) {
+                _pushTaskToQueue(task);
+            }
         } else {
             _executeTask(task);
         }
     }
 
     function _pushTaskToQueue(task) {
-        if (sails.hooks.queues.isReady(config.queue.name)) {
+        if (!sails.hooks.queues.isReady(config.queue.name)) {
             return;
         }
-        let slug = task + '.' + moment().add(config.queue.executor.ttl, 's').valueOf();
+        let slug = task + '.' + moment().add(config.queue.executor.cronJob.ttl, 's').valueOf();
         sails.hooks.queues.push(config.queue.name, slug)
           .then(() => {
-              sails.log.info(`Task: ${task} pushed to queue.`);
+              sails.log.info(`Task: ${task} pushed to queue`);
           });
     }
 
     function _executeTaskFromQueue() {
-        if (sails.hooks.queues.isReady(config.queue.name)) {
+        if (!sails.hooks.queues.isReady(config.queue.name)) {
             return;
         }
         sails.hooks.queues.pop(config.queue.name)
@@ -109,7 +122,7 @@ module.exports = function (sails) {
                     let task = message[0];
                     let ttl = message[1];
                     if (moment().valueOf() > ttl) {
-                        sails.log.debug('Task: `' + task + '` canceled.');
+                        sails.log.debug('Task: `' + task + '` canceled');
                         return _executeTaskFromQueue();
                     }
                     _executeTask(task)
@@ -119,7 +132,7 @@ module.exports = function (sails) {
     }
 
     function _executeTask(task) {
-        sails.config.scheduler.tasks[task].onTick();
+        sails.config.scheduler.jobs[task].onTick();
     }
 
     function _becomeLeader() {
@@ -133,17 +146,17 @@ module.exports = function (sails) {
                         sails.log.debug('I\'m cron leader!', workerId);
                     }
                 }
-            });
+            })
+            .catch(sails.log.error);
     }
 
     function _getCurrentLeader() {
-        return new Promise((resolve) => {
-            sails.getDatastore('cache').leaseConnection((db) => {
-                (util.promisify(db.get).bind(db))(config.queue.redis.ns + ':' + config.queue.leader.redisField).then((found) => {
-                    resolve(typeof found === 'string' ? JSON.parse(found) : null);
-                });
-            });
-        });
+        return sails.getDatastore(config.queue.redis.datastoreName).leaseConnection(async (db) => {
+            return await (util.promisify(db.get).bind(db))(config.queue.redis.ns + ':' + config.queue.leader.redisField);
+        })
+          .then((found) => {
+            return typeof found === 'string' ? JSON.parse(found) : null;
+        })
     }
 
     function _setCurrentLeader() {
@@ -151,13 +164,34 @@ module.exports = function (sails) {
             workerId: workerId,
             timestamp: moment().valueOf(),
         });
-        sails.getDatastore('cache').leaseConnection((db) => {
-            (util.promisify(db.setex).bind(db))(config.queue.redis.ns + ':' + config.queue.leader.redisField, config.queue.leader.ttl, obj);
-        });
+        sails.getDatastore(config.queue.redis.datastoreName).leaseConnection(async (db) => {
+            return await (util.promisify(db.setex).bind(db))(config.queue.redis.ns + ':' + config.queue.leader.redisField, config.queue.leader.ttl, obj);
+        })
+          .then(() => {
+              sails.log.debug('I\'m cron leader!', workerId);
+          })
     }
 
     function _getRandomHash() {
         return Math.random().toString(36).substring(7);
     }
 
+    /**
+     * Required hooks to be installed in the project.
+     * @private
+     */
+    function _checkDependencies() {
+        let modules = [];
+        if (config.queue.enable) {
+            if (!sails.hooks.cron) {
+                modules.push('sails-hook-cron');
+            }
+            if (!sails.hooks.queues) {
+                modules.push('sails-hook-custom-queues');
+            }
+        }
+        if (modules.length) {
+            throw new Error('To use hook `sails-hook-scheduler`, you need to install the following modules: ' + modules.join(', '));
+        }
+    }
 }
